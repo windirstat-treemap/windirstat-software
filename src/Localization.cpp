@@ -1,0 +1,217 @@
+﻿// WinDirStat - Windows Directory Statistics
+// Copyright © WinDirStat Team
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Distributed WITHOUT ANY WARRANTY; see LICENSE.md for details.
+
+#include "pch.h"
+#include "FinderBasic.h"
+
+std::unordered_map<std::wstring, std::wstring, string_hash, std::equal_to<>> Localization::m_map;
+bool Localization::m_rightToLeft = false;
+
+void Localization::SearchReplace(std::wstring& input, const std::wstring_view& search, const std::wstring_view& replace)
+{
+    for (size_t pos = 0; (pos = input.find(search, pos)) != std::wstring::npos; pos += replace.size())
+    {
+        input.replace(pos, search.size(), replace);
+    }
+}
+
+bool Localization::CrackStrings(const std::wstring& sFileData, const std::wstring& sPrefix)
+{
+    const bool hasPrefix = !sPrefix.empty();
+    const std::wstring prefix = sPrefix + wds::chrColon;
+
+    // Read the file line by line
+    std::wstring line;
+    std::wistringstream stream(sFileData);
+
+    // Look for the language prefix and return false if not found
+    if (hasPrefix && !sFileData.contains(prefix)) return false;
+
+    while (std::getline(stream, line))
+    {
+        // Filter out unwanted languages
+        if (hasPrefix && !line.starts_with(prefix)) continue;
+
+        // Parse the string after the first equals
+        SearchReplace(line, L"\r", wds::strEmpty);
+        SearchReplace(line, L"\\n", L"\n");
+        SearchReplace(line, L"\\t", L"\t");
+        if (const auto e = line.find_first_of(wds::chrEqual); e != wds::szNpos)
+        {
+            // Strip the prefix if any and add to map
+            const size_t startPos = hasPrefix ? line.find_first_of(wds::chrColon) + 1 : 0;
+            m_map[line.substr(startPos, e - startPos)] = line.substr(e + 1);
+        }
+    }
+    return !m_map.empty();
+}
+
+std::set<LANGID> Localization::GetLanguageList()
+{
+    // Decompress the resource
+    const auto resourceData = GetTextResource(IDR_LANGS);
+    if (resourceData.empty()) return {};
+
+    // Read the combined language line by line
+    std::wstring line;
+    std::wistringstream is(resourceData);
+    std::set<std::wstring> uniqueLangs;
+    while (std::getline(is, line))
+    {
+        // Convert to wide strings
+        SearchReplace(line, L"\r", wds::strEmpty);
+        auto linePos = line.find_first_of(wds::chrColon);
+        if (linePos == std::wstring::npos) continue;
+        uniqueLangs.emplace(line.substr(0, linePos));
+    }
+
+    // Also check for external language files
+    FinderBasic finder;
+    for (bool b = finder.FindFile(GetAppFolder(), L"lang_*.txt"); b; b = finder.FindNext())
+    {
+        auto langString = finder.GetFileName().substr(5);
+        langString = langString.substr(0, langString.find_first_of(L'.'));
+        uniqueLangs.emplace(langString);
+    }
+
+    // Convert to langids
+    std::set<LANGID> results;
+    for (const auto& lang : uniqueLangs)
+    {
+        const LCID lcid = LocaleNameToLCID(lang.c_str(), LOCALE_ALLOW_NEUTRAL_NAMES);
+        if (lcid == LOCALE_NEUTRAL || lcid == LOCALE_CUSTOM_UNSPECIFIED) continue;
+
+        const LANGID langid = LANGIDFROMLCID(lcid);
+        results.emplace(langid);
+    }
+
+    return results;
+}
+
+bool Localization::LoadResource(const LANGID language)
+{
+    const LCID lcid = MAKELCID(language, SORT_DEFAULT);
+    const std::wstring sResourceData = GetTextResource(IDR_LANGS);
+
+    // Load English strings first as a baseline fallback
+    CrackStrings(sResourceData, L"en");
+    m_rightToLeft = false;
+
+    if (GetLocaleInfo(lcid, LOCALE_SLANGUAGE, nullptr, 0) == 0) return true;
+
+    // Short-circuit the language resource loading sequence at the first successful load
+    const bool loaded =
+        LoadExternalLanguage(LOCALE_SNAME, language) ||                                 // External BCP 47 language file
+        LoadExternalLanguage(LOCALE_SISO639LANGNAME, language) ||                       // External ISO 639-1 language file
+        CrackStrings(sResourceData, GetLocaleString(LOCALE_SNAME, language)) ||         // Built-in BCP 47 resource
+        CrackStrings(sResourceData, GetLocaleString(LOCALE_SISO639LANGNAME, language)); // Built-in ISO 639-1 resource
+    m_rightToLeft = loaded && GetLocaleString(LOCALE_IREADINGLAYOUT, lcid) == L"1";
+    return loaded;
+}
+
+void Localization::UpdateMenu(MenuRef menu)
+{
+    for (const int i : std::views::iota(0, menu.GetItemCount()))
+    {
+        const std::wstring text = menu.GetItemText(i);
+        if (text.empty()) continue;
+
+        if (text.starts_with(L"ID") && Contains(text))
+        {
+            MENUITEMINFOW mi{ .cbSize = sizeof(MENUITEMINFOW) };
+            mi.fMask = MIIM_ID;
+            menu.GetItemInfo(i, &mi);
+
+            // Build the menu text with localized string and accelerator
+            std::wstring menuText = m_map[text];
+            if (mi.wID != std::bit_cast<UINT>(-1))
+            {
+                const std::wstring accel = GetAcceleratorString(mi.wID);
+                if (!accel.empty()) menuText += L"\t" + accel;
+            }
+
+            // Set the item text
+            mi.fMask = MIIM_STRING;
+            mi.dwTypeData = const_cast<LPWSTR>(menuText.c_str());
+            menu.SetItemInfo(i, &mi);
+        }
+
+        if (const auto sub = menu.GetSubMenu(i); sub != nullptr) UpdateMenu(sub);
+    }
+}
+
+void Localization::UpdateTabControl(CTabControl& tab)
+{
+    for (const int i : std::views::iota(0, tab.GetTabCount()))
+    {
+        const std::wstring_view label = tab.GetTabLabel(i);
+        if (label.starts_with(L"ID") && Contains(label))
+            tab.SetTabLabel(i, L" " + Lookup(label) + L" ");
+    }
+}
+
+void Localization::UpdateWindowText(WindowRef wnd)
+{
+    wnd.SetFont(GetAppFont(wnd.Handle()));
+
+    // Update window text if it's a localizable ID
+    const std::wstring text = wnd.GetText();
+    const bool localizable = text.starts_with(L"ID") && Contains(text);
+    if (localizable) wnd.SetText(m_map[text]);
+    std::array<WCHAR, MAX_CLASS_NAME> className{};
+    GetClassNameW(wnd.Handle(), className.data(), static_cast<int>(className.size()));
+    if (_wcsicmp(className.data(), WC_BUTTON) == 0 ||
+        (localizable && _wcsicmp(className.data(), WC_STATIC) == 0))
+        wnd.ModifyStyleEx(WS_EX_RTLREADING, m_rightToLeft ? WS_EX_RTLREADING : 0);
+}
+
+void Localization::UpdateDialogs(WindowRef wnd)
+{
+    UpdateWindowText(wnd);
+
+    for (auto child = wnd.GetWindow(GW_CHILD); child != nullptr;
+        child = child.GetWindow(GW_HWNDNEXT))
+    {
+        UpdateWindowText(child);
+    }
+}
+
+// Try to find and load external language file, return false if failed.
+bool Localization::LoadExternalLanguage(const LCTYPE lcttype, const LCID lcid)
+{
+    const std::wstring filename = L"lang_" + GetLocaleString(lcttype, lcid) + L".txt";
+    const std::wstring langFolder = GetAppFolder() + L"\\";
+
+    return FinderBasic::DoesFileExist(langFolder, filename) && LoadFile(langFolder + filename);
+}
+
+bool Localization::LoadFile(const std::wstring& file)
+{
+    // Open the file
+    std::ifstream f(file, std::ios::binary);
+    if (!f) return {};
+
+    const std::vector b((std::istreambuf_iterator(f)), {});
+    if (b.empty()) return {};
+
+    // Process the data
+    return CrackStrings(ConvertToWideString({ b.data(), b.size() }));
+}
+
+std::wstring Localization::ConvertToWideString(const std::string_view & sv)
+{
+    if (sv.empty()) return {};
+
+    const int required = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, sv.data(),
+        static_cast<int>(sv.size()), nullptr, 0);
+    if (required <= 0) return {};
+
+    std::wstring out(required, L'\0');
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, sv.data(),
+        static_cast<int>(sv.size()), out.data(), required) <= 0) return {};
+
+    return out;
+}
